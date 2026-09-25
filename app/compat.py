@@ -40,6 +40,12 @@ from typing import Any
 
 from jsonschema.validators import validator_for
 
+from app.localref import (
+    REASON_EXTERNAL,
+    ResolvedRef,
+    resolve_local_ref,
+)
+
 # ---------------------------------------------------------------------------
 # 通用辅助
 # ---------------------------------------------------------------------------
@@ -134,24 +140,6 @@ def _is_modern_ref_dialect(schema: Any) -> bool:
     return not _uses_legacy_dialect(schema, frozenset())
 
 
-def _resolve_pointer(root: Any, pointer: str) -> tuple[Any, bool]:
-    """按 JSON Pointer 在文档内解析 ``#`` / ``#/...`` 目标。"""
-    if pointer == "#":
-        return root, True
-    if not pointer.startswith("#/"):
-        return None, False
-    node: Any = root
-    for part in pointer[2:].split("/"):
-        part = part.replace("~1", "/").replace("~0", "~")
-        if isinstance(node, dict) and part in node:
-            node = node[part]
-        elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
-            node = node[int(part)]
-        else:
-            return None, False
-    return node, True
-
-
 def _combine_ref_siblings(siblings: dict, target: Any) -> Any:
     """新规范语义：合并引用目标与同级约束（两者同时生效）。
 
@@ -182,6 +170,11 @@ def resolve_refs(schema: Any, root: Any = None, seen: frozenset[str] = frozenset
     modern=True 按 2019-09+ 语义保留同级约束；modern=False 按 Draft-07 等
     旧规范语义忽略同级；modern=None 时按根 schema 的 ``$schema`` 声明与
     形态推断，整个文档沿用同一方言。
+
+    引用解析（斜杠切段、百分号 / ``~0`` / ``~1`` 解码、严格数组下标、
+    规范化目标）由 :func:`app.localref.resolve_local_ref` 统一提供，与
+    引用依赖诊断、实例脱敏定位到同一节点；``seen`` 记录的是**规范化目标
+    指针**，故同一目标的不同写法（``%2F`` 与 ``~1``）共享成环保护。
     """
     if root is None:
         root = schema
@@ -194,14 +187,19 @@ def resolve_refs(schema: Any, root: Any = None, seen: frozenset[str] = frozenset
 
     ref = schema.get("$ref")
     if isinstance(ref, str):
-        node, ok = _resolve_pointer(root, ref)
-        if ok and ref not in seen:
-            target_resolved = resolve_refs(copy.deepcopy(node), root,
-                                           seen | {ref}, modern)
-            if modern:
-                return _combine_ref_siblings(schema, target_resolved)
-            return target_resolved
-        if ok and ref in seen:
+        # 三个入口共用的本地 $ref 解析（先按原始斜杠切段，再解码百分号
+        # 与 ~0/~1，严格数组下标）：成功时目标节点与规范化指针来自同一
+        # 组件，保证与引用诊断 / 实例脱敏定位到同一节点
+        result = resolve_local_ref(root, ref)
+        if isinstance(result, ResolvedRef):
+            target_pointer = result.target
+            node = result.node
+            if target_pointer not in seen:
+                target_resolved = resolve_refs(copy.deepcopy(node), root,
+                                               seen | {target_pointer}, modern)
+                if modern:
+                    return _combine_ref_siblings(schema, target_resolved)
+                return target_resolved
             # 引用链成环：终止内联。旧规范退化为裸 $ref（同级本就被忽略）；
             # 新规范保留并继续展开同级约束，$ref 键留给原始校验器解析。
             if modern:
@@ -211,12 +209,13 @@ def resolve_refs(schema: Any, root: Any = None, seen: frozenset[str] = frozenset
                 schema = siblings  # 落入下方通用递归
             else:
                 return {"$ref": ref}
-        elif not ref.startswith("#"):
+        elif result.reason == REASON_EXTERNAL:
             # 外部引用（http(s)://、文件路径、裸名称锚点等）保持原样：
             # 结构比较把它当无约束节点，最终由原始 schema 校验把关
             pass
-        elif not ok:
-            # 无法解析的本地引用按"无约束"处理，避免误报
+        else:
+            # 无法解析的本地引用（目标不存在 / 名称片段 / 非法指针转义）
+            # 按"无约束"处理，避免误报
             return True
 
     out: dict[str, Any] = {}

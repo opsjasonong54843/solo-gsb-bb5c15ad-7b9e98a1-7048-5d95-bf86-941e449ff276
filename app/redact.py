@@ -10,12 +10,13 @@
   ``additionalProperties``、``prefixItems`` / 元组写法 ``items`` /
   ``additionalItems`` / 数组写法 ``items`` 均按实例实际结构下钻；
 * **解析文档内 ``#/...`` $ref**：只接受片段形式的本地引用
-  （``#`` 与 ``#/...`` JSON Pointer，RFC 6901），与引用依赖诊断一致，
-  绝不访问网络或外部文件。新方言（Draft 2019-09/2020-12，及未声明
-  ``$schema`` 但按形态判定为现代版本时）下 ``$ref`` 只是普通关键字，
-  引用目标与**同节点的同级子规则**（``properties`` /
-  ``patternProperties`` / ``additionalProperties`` 等对象属性、
-  ``prefixItems`` / ``items`` / ``additionalItems`` 数组项、
+  （``#`` 与 ``#/...`` JSON Pointer，RFC 6901），解析逻辑由
+  :mod:`app.localref` 统一提供（与兼容性分析、引用诊断共用同一组件，
+  同一条引用定位到同一节点），绝不访问网络或外部文件。新方言（Draft
+  2019-09/2020-12，及未声明 ``$schema`` 但按形态判定为现代版本时）下
+  ``$ref`` 只是普通关键字，引用目标与**同节点的同级子规则**
+  （``properties`` / ``patternProperties`` / ``additionalProperties``
+  等对象属性、``prefixItems`` / ``items`` / ``additionalItems`` 数组项、
   ``allOf`` / ``oneOf`` / ``anyOf`` 组合分支）同时生效，均参与遍历；
   Draft-07 及更早方言中 ``$ref`` 是纯跳转，同级子规则被忽略；
 * **组合关键字**：``oneOf`` / ``anyOf`` 只遍历对**当前实例（原值）**
@@ -39,9 +40,11 @@ import re
 from typing import Any
 
 from app.compat import _is_modern_ref_dialect, escape_pointer, make_validator
-from app.refgraph import (
-    _classify_ref,
-    _pointer_segments,
+from app.localref import (
+    ReferenceError,
+    node_at_pointer as _node_at_pointer,
+    pointer_segments as _pointer_segments,
+    resolve_local_ref,
 )
 
 # 脱敏掩码：所有 x-sensitive 命中位置统一替换为该字符串。
@@ -79,14 +82,6 @@ def _child_pointer(pointer: str, token: Any) -> str:
     """在 schema / 实例指针后追加一段（对象键或数组下标）。"""
     segment = escape_pointer(str(token))
     return f"#/{segment}" if pointer == "#" else f"{pointer}/{segment}"
-
-
-def _node_at_pointer(root: Any, pointer: str) -> Any:
-    """按规范化后的本地指针取节点（``#`` 为根）。"""
-    node = root
-    for segment in _pointer_segments(pointer):
-        node = node[segment] if isinstance(node, dict) else node[int(segment)]
-    return node
 
 
 def _sort_key(pointer: str) -> tuple:
@@ -156,17 +151,16 @@ class _RedactionWalker:
     def _classify(self, node: dict, schema_pointer: str,
                   instance_pointer: str) -> str:
         """分类节点上的 ``$ref``，返回规范化目标指针；非法则抛 422 异常。"""
-        target_pointer, invalid = _classify_ref(
-            self.root_schema, node.get("$ref"))
-        if invalid is not None:
+        result = resolve_local_ref(self.root_schema, node.get("$ref"))
+        if isinstance(result, ReferenceError):
             raise UnresolvableReference(
                 schema_pointer=schema_pointer,
-                ref=invalid["ref"],
-                reason=invalid["reason"],
-                message=invalid["message"],
+                ref=result.ref,
+                reason=result.reason,
+                message=result.message,
                 instance_pointer=instance_pointer,
             )
-        return target_pointer
+        return result.target
 
     def _branch_valid(self, branch: Any, value: Any) -> bool:
         """子 schema 分支是否对当前实例（原值）校验通过。"""

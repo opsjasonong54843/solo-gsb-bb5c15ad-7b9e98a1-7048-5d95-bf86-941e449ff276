@@ -1308,6 +1308,68 @@ def test_redact_external_ref_returns_422(client):
     assert resp.json()["detail"]["reason"] == "external_reference"
 
 
+def test_redact_malformed_pointer_ref_returns_422(client):
+    # 非法 ~ 转义（~2）：与引用诊断同一原因码 malformed_pointer
+    resp = client.post("/api/analyses", json={
+        "old_schema": {"type": "object"},
+        "new_schema": {"properties": {"p": {"$ref": "#/$defs/~2"}}},
+    })
+    analysis_id = resp.json()["id"]
+    resp = client.post(f"/api/analyses/{analysis_id}/redact",
+                       json={"documents": [{"p": 1}]})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "malformed_pointer"
+    assert detail["schema_pointer"] == "#/properties/p"
+    assert detail["instance_pointer"] == "#/p"
+
+
+def test_redact_name_fragment_ref_returns_422(client):
+    resp = client.post("/api/analyses", json={
+        "old_schema": {"type": "object"},
+        "new_schema": {"properties": {"p": {"$ref": "#anchor"}}},
+    })
+    analysis_id = resp.json()["id"]
+    resp = client.post(f"/api/analyses/{analysis_id}/redact",
+                       json={"documents": [{"p": 1}]})
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["reason"] == "name_fragment_unsupported"
+
+
+def test_redact_percent_encoded_ref_matches_diagnostics(client):
+    # 跨入口边界：%2F 百分号斜杠在脱敏与引用诊断中归一到同一目标
+    new_schema = {
+        "type": "object",
+        "properties": {"p": {"$ref": "#/$defs/a%2Fb"}},
+        "$defs": {"a/b": {"type": "string", "x-sensitive": True}},
+    }
+    # 诊断入口（不落库）：规范化目标使用 ~1
+    diag = client.post("/api/reference-diagnostics",
+                       json={"schema": new_schema})
+    assert diag.status_code == 200
+    assert diag.json()["invalid_refs"] == []
+    assert diag.json()["edges"] == [{
+        "source": "#/properties/p",
+        "ref": "#/$defs/a%2Fb",
+        "target": "#/$defs/a~1b",
+    }]
+    # 脱敏入口（422 通道之外的正常路径）：同一目标节点被命中
+    resp = client.post("/api/analyses", json={
+        "old_schema": {"type": "object"},
+        "new_schema": new_schema,
+    })
+    analysis_id = resp.json()["id"]
+    resp = client.post(f"/api/analyses/{analysis_id}/redact",
+                       json={"documents": [{"p": "secret"}]})
+    assert resp.status_code == 200, resp.text
+    result = resp.json()["results"][0]
+    assert result["redacted"] == {"p": "***"}
+    assert result["replacements"] == [{
+        "instance_pointer": "#/p",
+        "schema_pointer": "#/$defs/a~1b",
+    }]
+
+
 def test_redact_uses_new_schema_not_old(client):
     # 敏感标记只在新 schema 上：脱敏按新 schema 生效
     resp = client.post("/api/analyses", json={

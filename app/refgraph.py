@@ -2,7 +2,9 @@
 
 输入一份 JSON Schema，遍历文档内部全部 ``$ref``，仅接受**片段形式的本地
 引用**（``#`` 与 ``#/...`` JSON Pointer），按 RFC 6901 在本文档内解析
-目标节点，输出：
+目标节点。指针解析（斜杠切段、百分号 / ``~0`` / ``~1`` 解码、严格数组
+下标、规范化目标指针）由 :mod:`app.localref` 统一提供，兼容性分析与
+实例脱敏对同一条引用得到完全一致的定位与失败原因；本模块输出：
 
 * ``edges``：可解析的引用边（源节点指针 -> 规范化目标指针）；
 * ``invalid_refs``：不可用引用的精确定位与原因（非本地引用 / 名称片段 /
@@ -58,7 +60,19 @@ from __future__ import annotations
 
 from collections import deque
 from typing import Any
-from urllib.parse import unquote
+
+from app.localref import (
+    REASON_EXTERNAL,
+    REASON_MALFORMED_POINTER,
+    REASON_NAME_FRAGMENT,
+    REASON_NON_STRING,
+    REASON_TARGET_NOT_FOUND,
+    ResolvedRef,
+    build_pointer as _build_pointer,
+    escape_token as _escape_token,
+    pointer_segments as _pointer_segments,
+    resolve_local_ref,
+)
 
 # 定义容器关键字：值为「名称 -> 子 schema」映射
 _DEFINITION_KEYWORDS = frozenset({"$defs", "definitions"})
@@ -87,148 +101,30 @@ _SUBSCHEMA_MAP_KEYWORDS = frozenset({
 # 值为子 schema 数组的关键字
 _SUBSCHEMA_ARRAY_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
 
-# 不可用引用的原因代码
-REASON_EXTERNAL = "external_reference"
-REASON_NAME_FRAGMENT = "name_fragment_unsupported"
-REASON_TARGET_NOT_FOUND = "target_not_found"
-REASON_MALFORMED_POINTER = "malformed_pointer"
-REASON_NON_STRING = "non_string_ref"
+# 不可用引用的原因代码由 app.localref 统一提供（上方导入即模块级常量）。
 
 
 # ---------------------------------------------------------------------------
-# JSON Pointer 工具
+# 引用分类（共用 app.localref 的本地 $ref 解析）
 # ---------------------------------------------------------------------------
-
-
-def _escape_token(token: str) -> str:
-    """JSON Pointer 段编码：``~`` -> ``~0``、``/`` -> ``~1``。"""
-    return token.replace("~", "~0").replace("/", "~1")
-
-
-def _build_pointer(tokens: list[str]) -> str:
-    """由解码后的路径段构造规范化 JSON Pointer 字符串（根为 ``#``）。"""
-    if not tokens:
-        return "#"
-    return "#/" + "/".join(_escape_token(token) for token in tokens)
-
-
-def _pointer_segments(pointer: str) -> list[str]:
-    """拆分已规范化的指针字符串为解码后的路径段（根 ``#`` 为空列表）。"""
-    if pointer == "#":
-        return []
-    return [
-        seg.replace("~1", "/").replace("~0", "~")
-        for seg in pointer[2:].split("/")
-    ]
-
-
-def _decode_pointer_fragment(fragment: str) -> list[str] | None:
-    """解码 URI fragment 中的 JSON Pointer（fragment 不含前导 ``#/``）。
-
-    先按 ``/`` 切段（``%2F`` 是键名中的字面斜杠，不做分隔符），再逐段
-    百分号解码并还原 ``~1`` / ``~0`` 转义。非法 ``~`` 转义返回 ``None``。
-    """
-    tokens: list[str] = []
-    for raw in fragment.split("/"):
-        token = unquote(raw)
-        decoded = ""
-        i = 0
-        while i < len(token):
-            ch = token[i]
-            if ch == "~":
-                if i + 1 >= len(token) or token[i + 1] not in ("0", "1"):
-                    return None
-                decoded += "~" if token[i + 1] == "0" else "/"
-                i += 2
-            else:
-                decoded += ch
-                i += 1
-        tokens.append(decoded)
-    return tokens
-
-
-def _resolve_pointer(root: Any, tokens: list[str]) -> tuple[bool, str]:
-    """按 JSON Pointer 在文档内解析目标。
-
-    返回 ``(是否成功, 失败段)``：成功时失败段为空；失败时给出首个无法
-    解析的路径段（已解码原文）。数组下标遵循 RFC 6901（``0`` 合法、
-    带前导零非法、``-`` 指向不存在的末位后成员）。
-    """
-    node = root
-    for token in tokens:
-        if isinstance(node, dict):
-            if token in node:
-                node = node[token]
-            else:
-                return False, token
-        elif isinstance(node, list):
-            if token == "-" or not token.isdigit() or (
-                len(token) > 1 and token.startswith("0")
-            ):
-                return False, token
-            index = int(token)
-            if index >= len(node):
-                return False, token
-            node = node[index]
-        else:
-            return False, token
-    return True, ""
 
 
 def _classify_ref(root: Any, ref: Any) -> tuple[str | None, dict | None]:
     """分类单个 ``$ref`` 取值，返回 ``(target_pointer, invalid_entry)``。
 
-    二者恰有一个非 None：可解析的本地 Pointer 引用返回目标指针；其余
-    情况返回不含 source 的不可用条目（由调用方补上 source）。
+    三者入口共用的解析逻辑在 :func:`app.localref.resolve_local_ref`；
+    这里仅把结构化结果适配为遍历器使用的二元组：可解析的本地 Pointer
+    引用返回目标指针；其余情况返回不含 source 的不可用条目（由调用方
+    补上 source）。
     """
-    if not isinstance(ref, str):
-        return None, {
-            "ref": None,
-            "reason": REASON_NON_STRING,
-            "message": f"$ref 必须是字符串，实际类型为 {type(ref).__name__}",
-        }
-
-    before, separator, fragment = ref.partition("#")
-    if before or not separator:
-        # 非片段形式（http(s)://、相对文件路径、裸名称等）：一律不访问
-        return None, {
-            "ref": ref,
-            "reason": REASON_EXTERNAL,
-            "message": "仅接受片段形式的本地引用（# 或 #/...），不访问网络或外部文件",
-        }
-
-    if fragment == "":
-        # "#"：指向文档根
-        return "#", None
-
-    if not fragment.startswith("/"):
-        # "#anchor" 之类的名称片段（draft 2019-09 锚点）：不做解析
-        return None, {
-            "ref": ref,
-            "reason": REASON_NAME_FRAGMENT,
-            "message": "仅支持 JSON Pointer 片段（#/...），不支持锚点名称片段",
-        }
-
-    tokens = _decode_pointer_fragment(fragment[1:])
-    if tokens is None:
-        return None, {
-            "ref": ref,
-            "reason": REASON_MALFORMED_POINTER,
-            "message": "非法 JSON Pointer：~ 后只能为 0 或 1",
-        }
-
-    ok, failed_segment = _resolve_pointer(root, tokens)
-    if not ok:
-        return None, {
-            "ref": ref,
-            "reason": REASON_TARGET_NOT_FOUND,
-            "message": (
-                f"引用目标 {_build_pointer(tokens)} 在路径段 "
-                f"{_escape_token(failed_segment)!r} 处不存在"
-            ),
-        }
-
-    return _build_pointer(tokens), None
+    result = resolve_local_ref(root, ref)
+    if isinstance(result, ResolvedRef):
+        return result.target, None
+    return None, {
+        "ref": result.ref,
+        "reason": result.reason,
+        "message": result.message,
+    }
 
 
 # ---------------------------------------------------------------------------

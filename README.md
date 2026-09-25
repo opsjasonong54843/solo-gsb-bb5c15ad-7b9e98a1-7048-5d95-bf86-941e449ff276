@@ -18,6 +18,7 @@
 .
 ├── app/
 │   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放、回放最小覆盖、变异覆盖评估、x-sensitive 实例脱敏、$ref 引用依赖诊断
+│   ├── localref.py      # 三入口共用的本地 $ref 指针解析（按原始斜杠切段 + 百分号/~0/~1 解码 + 严格数组下标，返回规范化目标或明确失败原因）
 │   ├── compat.py        # 兼容性分析引擎（递归比较 + 最小反例生成）
 │   ├── refgraph.py      # 单份 schema 的 $ref 引用依赖诊断（引用边 / 不可达 $defs / 循环链 / 无效目标，只读不落库）
 │   ├── profile.py       # 合规画像引擎（批量文档校验 + oneOf/anyOf 最深公共失败路径 + 稳定指纹归并）
@@ -41,6 +42,7 @@
 │   ├── test_coverage.py # 回放最小覆盖引擎单元测试（贪心选择 / 并列排序 / 方向筛选 / 未覆盖 issue）
 │   ├── test_mutation.py # 变异覆盖引擎单元测试（单点变异生成 / 等价过滤 / 上限 / 杀死判定）
 │   ├── test_redact.py   # 实例脱敏引擎单元测试（对象/数组遍历 / $ref / oneOf/anyOf/allOf / 递归终止 / 不可解析引用）
+│   ├── test_localref_cross_entry.py # 三入口 $ref 解析一致性回归（百分号/~0/~1 / 严格数组下标 / 失败原因 / 新旧 Draft 同级语义）
 │   ├── test_compare.py  # 基线对比单元测试
 │   ├── test_gate.py     # 发布门禁单元测试
 │   └── test_api.py      # 接口端到端测试
