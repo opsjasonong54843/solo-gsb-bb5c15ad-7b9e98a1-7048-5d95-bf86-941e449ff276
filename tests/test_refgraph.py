@@ -1,7 +1,7 @@
 """引用依赖诊断引擎（app.refgraph）单元测试。"""
 import pytest
 
-from app import refgraph
+from app import refpointer
 from app.refgraph import analyze_references
 
 
@@ -603,8 +603,9 @@ class TestDeterminism:
     ],
 )
 def test_classify_ref_cases(ref, expected_reason):
+    # 引用分类逻辑由共用组件 app.refpointer 提供，refgraph 直接复用
     root = {"$defs": {"A": {"type": "string"}}}
-    target, invalid = refgraph._classify_ref(root, ref)
+    target, invalid = refpointer.classify_ref(root, ref)
     if expected_reason is None:
         assert invalid is None
         assert target is not None

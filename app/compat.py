@@ -40,6 +40,8 @@ from typing import Any
 
 from jsonschema.validators import validator_for
 
+from app.refpointer import REASON_EXTERNAL, classify_ref, node_at_pointer
+
 # ---------------------------------------------------------------------------
 # 通用辅助
 # ---------------------------------------------------------------------------
@@ -98,7 +100,10 @@ def member_of_enum(value: Any, enum: list) -> bool:
 # $ref 预解析（支持文档内 #/... 引用，带环保护）
 # ---------------------------------------------------------------------------
 #
-# 不同规范下 ``$ref`` 的同级约束语义不同，展开时必须分别处理：
+# 本地 $ref 的分段、解码、严格数组下标与失败分类统一由共用组件
+# app.refpointer 完成（与引用依赖诊断、实例脱敏定位到同一节点）；
+# 本模块只负责展开策略。不同规范下 ``$ref`` 的同级约束语义不同，
+# 展开时必须分别处理：
 #
 # * Draft 2019-09 / 2020-12：``$ref`` 与同级的 ``minimum``、``required``、
 #   ``type`` 等关键字**同时生效**。展开时把引用目标与同级约束合并
@@ -109,8 +114,10 @@ def member_of_enum(value: Any, enum: list) -> bool:
 #
 # 嵌套引用（目标内再引用）逐层递归展开；引用链成环时终止——旧规范在环上
 # 退化为裸 ``$ref`` 节点，新规范保留同级约束但不再重复内联目标，由
-# ``effective`` / 各遍历器的幂等处理保证结构比较可终止。反例的最终
-# 可信度始终由**原始 schema**上的 jsonschema 校验把关（见 analyze）。
+# ``effective`` / 各遍历器的幂等处理保证结构比较可终止。判环按共用组件
+# 返回的**规范化目标指针**进行，同一节点的不同写法（``%2F`` / ``~1``
+# 等）不会绕过环检测。反例的最终可信度始终由**原始 schema**上的
+# jsonschema 校验把关（见 analyze）。
 
 _LEGACY_REF_DIALECTS = ("draft-04", "draft/04", "draft-06", "draft/06",
                         "draft-07", "draft/07")
@@ -132,24 +139,6 @@ def _is_modern_ref_dialect(schema: Any) -> bool:
         if any(token in lowered for token in _LEGACY_REF_DIALECTS):
             return False
     return not _uses_legacy_dialect(schema, frozenset())
-
-
-def _resolve_pointer(root: Any, pointer: str) -> tuple[Any, bool]:
-    """按 JSON Pointer 在文档内解析 ``#`` / ``#/...`` 目标。"""
-    if pointer == "#":
-        return root, True
-    if not pointer.startswith("#/"):
-        return None, False
-    node: Any = root
-    for part in pointer[2:].split("/"):
-        part = part.replace("~1", "/").replace("~0", "~")
-        if isinstance(node, dict) and part in node:
-            node = node[part]
-        elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
-            node = node[int(part)]
-        else:
-            return None, False
-    return node, True
 
 
 def _combine_ref_siblings(siblings: dict, target: Any) -> Any:
@@ -181,7 +170,9 @@ def resolve_refs(schema: Any, root: Any = None, seen: frozenset[str] = frozenset
 
     modern=True 按 2019-09+ 语义保留同级约束；modern=False 按 Draft-07 等
     旧规范语义忽略同级；modern=None 时按根 schema 的 ``$schema`` 声明与
-    形态推断，整个文档沿用同一方言。
+    形态推断，整个文档沿用同一方言。``seen`` 持有解析链上已展开引用的
+    **规范化目标指针**（app.refpointer 统一分段 / 解码 / 严格下标解析），
+    同一节点的不同写法同样触发环终止。
     """
     if root is None:
         root = schema
@@ -194,14 +185,15 @@ def resolve_refs(schema: Any, root: Any = None, seen: frozenset[str] = frozenset
 
     ref = schema.get("$ref")
     if isinstance(ref, str):
-        node, ok = _resolve_pointer(root, ref)
-        if ok and ref not in seen:
+        target_pointer, invalid = classify_ref(root, ref)
+        if target_pointer is not None and target_pointer not in seen:
+            node = node_at_pointer(root, target_pointer)
             target_resolved = resolve_refs(copy.deepcopy(node), root,
-                                           seen | {ref}, modern)
+                                           seen | {target_pointer}, modern)
             if modern:
                 return _combine_ref_siblings(schema, target_resolved)
             return target_resolved
-        if ok and ref in seen:
+        if target_pointer is not None:
             # 引用链成环：终止内联。旧规范退化为裸 $ref（同级本就被忽略）；
             # 新规范保留并继续展开同级约束，$ref 键留给原始校验器解析。
             if modern:
@@ -211,12 +203,13 @@ def resolve_refs(schema: Any, root: Any = None, seen: frozenset[str] = frozenset
                 schema = siblings  # 落入下方通用递归
             else:
                 return {"$ref": ref}
-        elif not ref.startswith("#"):
-            # 外部引用（http(s)://、文件路径、裸名称锚点等）保持原样：
+        elif invalid["reason"] == REASON_EXTERNAL:
+            # 外部引用（http(s)://、文件路径、裸名称等）保持原样：
             # 结构比较把它当无约束节点，最终由原始 schema 校验把关
             pass
-        elif not ok:
-            # 无法解析的本地引用按"无约束"处理，避免误报
+        else:
+            # 无法解析的本地引用（名称片段 / 非法指针 / 目标不存在）
+            # 按"无约束"处理，避免误报
             return True
 
     out: dict[str, Any] = {}

@@ -10,8 +10,9 @@
   ``additionalProperties``、``prefixItems`` / 元组写法 ``items`` /
   ``additionalItems`` / 数组写法 ``items`` 均按实例实际结构下钻；
 * **解析文档内 ``#/...`` $ref**：只接受片段形式的本地引用
-  （``#`` 与 ``#/...`` JSON Pointer，RFC 6901），与引用依赖诊断一致，
-  绝不访问网络或外部文件。新方言（Draft 2019-09/2020-12，及未声明
+  （``#`` 与 ``#/...`` JSON Pointer，RFC 6901），指针分段 / 解码 /
+  严格数组下标与失败分类统一由共用组件 :mod:`app.refpointer` 完成，
+  与兼容性分析、引用依赖诊断定位到同一节点，绝不访问网络或外部文件。新方言（Draft 2019-09/2020-12，及未声明
   ``$schema`` 但按形态判定为现代版本时）下 ``$ref`` 只是普通关键字，
   引用目标与**同节点的同级子规则**（``properties`` /
   ``patternProperties`` / ``additionalProperties`` 等对象属性、
@@ -39,10 +40,7 @@ import re
 from typing import Any
 
 from app.compat import _is_modern_ref_dialect, escape_pointer, make_validator
-from app.refgraph import (
-    _classify_ref,
-    _pointer_segments,
-)
+from app.refpointer import classify_ref, node_at_pointer, pointer_segments
 
 # 脱敏掩码：所有 x-sensitive 命中位置统一替换为该字符串。
 REDACTION_MASK = "***"
@@ -81,18 +79,10 @@ def _child_pointer(pointer: str, token: Any) -> str:
     return f"#/{segment}" if pointer == "#" else f"{pointer}/{segment}"
 
 
-def _node_at_pointer(root: Any, pointer: str) -> Any:
-    """按规范化后的本地指针取节点（``#`` 为根）。"""
-    node = root
-    for segment in _pointer_segments(pointer):
-        node = node[segment] if isinstance(node, dict) else node[int(segment)]
-    return node
-
-
 def _sort_key(pointer: str) -> tuple:
     """实例指针的确定性排序键：按路径深度，数组下标段按数值比较。"""
     key: tuple = ()
-    for token in _pointer_segments(pointer):
+    for token in pointer_segments(pointer):
         if token.isdigit() and not (len(token) > 1 and token.startswith("0")):
             # (类型标志, 数值, 键名)：数字段统一三元组，避免跨段比较类型冲突
             key += (0, int(token), "")
@@ -107,9 +97,9 @@ def _apply_masks(document: Any, pointers: list[str]) -> Any:
         # 根节点被标记：整篇文档替换为掩码，更深的命中点不再存在
         return REDACTION_MASK
     result = copy.deepcopy(document)
-    for pointer in sorted(pointers, key=lambda p: len(_pointer_segments(p)),
+    for pointer in sorted(pointers, key=lambda p: len(pointer_segments(p)),
                           reverse=True):
-        tokens = _pointer_segments(pointer)
+        tokens = pointer_segments(pointer)
         parent: Any = result
         for token in tokens[:-1]:
             parent = parent[token] if isinstance(parent, dict) else parent[int(token)]
@@ -156,7 +146,7 @@ class _RedactionWalker:
     def _classify(self, node: dict, schema_pointer: str,
                   instance_pointer: str) -> str:
         """分类节点上的 ``$ref``，返回规范化目标指针；非法则抛 422 异常。"""
-        target_pointer, invalid = _classify_ref(
+        target_pointer, invalid = classify_ref(
             self.root_schema, node.get("$ref"))
         if invalid is not None:
             raise UnresolvableReference(
@@ -205,7 +195,7 @@ class _RedactionWalker:
                                             instance_pointer)
             if target_pointer not in seen:
                 seen.add(target_pointer)
-                target = _node_at_pointer(self.root_schema, target_pointer)
+                target = node_at_pointer(self.root_schema, target_pointer)
                 self.collect(target, value, target_pointer,
                              instance_pointer, seen)
             # 即使目标已在 seen 中（嵌套 / 循环 / 经由其他分支重复的引用

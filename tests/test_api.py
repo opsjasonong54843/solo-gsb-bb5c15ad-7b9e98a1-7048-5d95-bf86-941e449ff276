@@ -1533,6 +1533,76 @@ def test_reference_diagnostics_is_readonly(client):
 
 
 # ---------------------------------------------------------------------------
+# 跨入口边界回归：同一 $ref 在诊断 / 脱敏 / 兼容性分析三个入口行为一致
+# ---------------------------------------------------------------------------
+
+
+def test_cross_entry_invalid_ref_consistent_reason(client):
+    # 同一不可解析引用：诊断条目、脱敏 422、兼容性分析降级互不矛盾
+    schema = {
+        "type": "object",
+        "properties": {"p": {"$ref": "#/$defs/Missing"}},
+    }
+    # 1) 引用依赖诊断：invalid_refs 诊断条目
+    diag = client.post("/api/reference-diagnostics", json={"schema": schema})
+    assert diag.status_code == 200
+    assert diag.json()["invalid_refs"][0]["reason"] == "target_not_found"
+
+    # 2) 兼容性分析：不可解析的本地引用降级为无约束，分析正常完成
+    created = client.post("/api/analyses", json={
+        "old_schema": {"type": "object"},
+        "new_schema": schema,
+    })
+    assert created.status_code == 201, created.text
+    analysis_id = created.json()["id"]
+
+    # 3) 实例脱敏：同一引用 -> 422，原因代码与诊断条目一致
+    redacted = client.post(f"/api/analyses/{analysis_id}/redact",
+                           json={"documents": [{"p": 1}]})
+    assert redacted.status_code == 422
+    detail = redacted.json()["detail"]
+    assert detail["reason"] == "target_not_found"
+    assert detail["schema_pointer"] == "#/properties/p"
+
+
+def test_cross_entry_percent_encoded_ref_same_target(client):
+    # %2F 与 ~1 两种写法在三个入口归一到同一节点（共用解析组件）
+    schema = {
+        "type": "object",
+        "properties": {
+            "pct": {"$ref": "#/$defs/a%2Fb"},
+            "tilde": {"$ref": "#/$defs/a~1b"},
+        },
+        "$defs": {"a/b": {"type": "string", "x-sensitive": True}},
+    }
+    # 引用依赖诊断：两条边的规范化目标相同
+    diag = client.post("/api/reference-diagnostics", json={"schema": schema})
+    assert diag.status_code == 200
+    targets = {e["source"]: e["target"] for e in diag.json()["edges"]}
+    assert targets["#/properties/pct"] == "#/$defs/a~1b"
+    assert targets["#/properties/tilde"] == "#/$defs/a~1b"
+
+    # 兼容性分析：两种写法都能展开（分析正常完成）
+    created = client.post("/api/analyses", json={
+        "old_schema": {"type": "object"},
+        "new_schema": schema,
+    })
+    assert created.status_code == 201, created.text
+    analysis_id = created.json()["id"]
+
+    # 实例脱敏：两个属性都命中同一 schema 节点
+    redacted = client.post(f"/api/analyses/{analysis_id}/redact",
+                           json={"documents": [{"pct": "s", "tilde": "t"}]})
+    assert redacted.status_code == 200, redacted.text
+    result = redacted.json()["results"][0]
+    assert result["redacted"] == {"pct": "***", "tilde": "***"}
+    pointers = {r["instance_pointer"]: r["schema_pointer"]
+                for r in result["replacements"]}
+    assert pointers["#/pct"] == "#/$defs/a~1b"
+    assert pointers["#/tilde"] == "#/$defs/a~1b"
+
+
+# ---------------------------------------------------------------------------
 # POST /api/analyses/{id}/counterexample-reduction 兼容性反例缩减
 # ---------------------------------------------------------------------------
 
